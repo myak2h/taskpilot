@@ -1,0 +1,9 @@
+fastapi==0.162.5
+uvicorn[standard]==0.54.0
+sqlalchemy==2.1.8
+# SQLAlchemy 2.1 defaults to psycopg; keep psycopg2 for explicit legacy URLs.
+psycopg[binary]==3.3.9
+psycopg2-binary==2.9.13
+openai==3.49.0
+httpx==0.28.1
+python-dotenv==1.2.4
