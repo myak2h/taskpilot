@@ -4,6 +4,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from . import models
+from .agent import run_agent
 from .db import Base, engine, get_db
 
 Base.metadata.create_all(engine)
@@ -26,9 +27,18 @@ class TaskPatch(BaseModel):
     done: bool | None = None
 
 
+class ChatIn(BaseModel):
+    message: str
+    conversation_id: int | None = None
+
+
 def task_out(t: models.Task) -> dict:
     return {"id": t.id, "title": t.title, "notes": t.notes, "priority": t.priority,
             "due": t.due, "done": t.done}
+
+
+def msg_out(m: models.Message) -> dict:
+    return {"id": m.id, "role": m.role, "content": m.content, "suggestions": m.suggestions or []}
 
 
 @app.get("/api/health")
@@ -70,3 +80,35 @@ def delete_task(task_id: int, db: Session = Depends(get_db)):
     if t:
         db.delete(t)
         db.commit()
+
+
+@app.post("/api/chat")
+def chat(body: ChatIn, db: Session = Depends(get_db)):
+    convo = db.get(models.Conversation, body.conversation_id) if body.conversation_id else None
+    if not convo:
+        convo = models.Conversation()
+        db.add(convo)
+        db.commit()
+        db.refresh(convo)
+
+    prior = (db.query(models.Message).filter_by(conversation_id=convo.id)
+             .order_by(models.Message.id.desc()).limit(12).all())[::-1]
+    history = [{"role": m.role, "content": m.content} for m in prior]
+
+    db.add(models.Message(conversation_id=convo.id, role="user", content=body.message))
+    try:
+        reply, suggestions = run_agent(db, history, body.message)
+    except Exception as e:  # LLM/network failure
+        db.rollback()
+        raise HTTPException(502, f"The AI service failed: {e}")
+    m = models.Message(conversation_id=convo.id, role="assistant", content=reply, suggestions=suggestions)
+    db.add(m)
+    db.commit()
+    db.refresh(m)
+    return {"conversation_id": convo.id, "message": msg_out(m)}
+
+
+@app.get("/api/conversations/{cid}/messages")
+def messages(cid: int, db: Session = Depends(get_db)):
+    rows = db.query(models.Message).filter_by(conversation_id=cid).order_by(models.Message.id).all()
+    return [msg_out(m) for m in rows]

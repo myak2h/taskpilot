@@ -33,6 +33,14 @@ class AppCompatibilityTest(unittest.TestCase):
             history = self.client.get(f"/api/conversations/{conversation_id}/messages").json()
             self.assertEqual([item["role"] for item in history], ["user", "assistant"])
 
+        created = self.client.post("/api/tasks", json=message["suggestions"][0])
+        self.assertEqual(created.status_code, 201)
+        task_id = created.json()["id"]
+        updated = self.client.patch(f"/api/tasks/{task_id}", json={"done": True})
+        self.assertTrue(updated.json()["done"])
+        self.assertIn(task_id, [task["id"] for task in self.client.get("/api/tasks").json()])
+        self.assertEqual(self.client.delete(f"/api/tasks/{task_id}").status_code, 204)
+
 
 if __name__ == "__main__":
     unittest.main()
