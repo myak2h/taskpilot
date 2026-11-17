@@ -55,6 +55,17 @@ export default function App() {
     }
   }
 
+  async function addTasks(msgIndex, picks) {
+    for (const t of picks) await api("/tasks", { method: "POST", body: t });
+    // mark those suggestions as added in the UI
+    setMessages((ms) =>
+      ms.map((m, i) =>
+        i === msgIndex ? { ...m, suggestions: m.suggestions.filter((s) => !picks.includes(s)) } : m
+      )
+    );
+    loadTasks();
+  }
+
   const toggle = async (t) => {
     await api(`/tasks/${t.id}`, { method: "PATCH", body: { done: !t.done } });
     loadTasks();
@@ -99,6 +110,25 @@ export default function App() {
           {messages.map((m, i) => (
             <div key={i} className={`msg ${m.role}`}>
               <p>{m.content}</p>
+              {m.suggestions?.length > 0 && (
+                <div className="suggest">
+                  {m.suggestions.map((s, j) => (
+                    <div className="sug" key={j}>
+                      <span className={`dot ${s.priority}`} title={`${s.priority} priority`} />
+                      <div>
+                        <strong>{s.title}</strong>
+                        {s.due && <small>Due {s.due}</small>}
+                      </div>
+                      <button onClick={() => addTasks(i, [s])}>Add task</button>
+                    </div>
+                  ))}
+                  {m.suggestions.length > 1 && (
+                    <button className="primary" onClick={() => addTasks(i, m.suggestions)}>
+                      Add all {m.suggestions.length} tasks
+                    </button>
+                  )}
+                </div>
+              )}
             </div>
           ))}
           {busy && <div className="msg assistant typing" aria-live="polite">Thinking…</div>}
