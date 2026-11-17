@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 const api = async (path, opts = {}) => {
   const res = await fetch(`/api${path}`, {
@@ -10,16 +10,50 @@ const api = async (path, opts = {}) => {
   return res.status === 204 ? null : res.json();
 };
 
+const PROMPTS = [
+  "I'm launching a newsletter next week and need to write, design and schedule it",
+  "Plan my Saturday: groceries, laundry, call mom, gym",
+  "What's on my plate?",
+];
+
 export default function App() {
   const [tasks, setTasks] = useState([]);
+  const [messages, setMessages] = useState([]);
+  const [convId, setConvId] = useState(() => Number(localStorage.getItem("conv")) || null);
+  const [input, setInput] = useState("");
   const [title, setTitle] = useState("");
+  const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const endRef = useRef(null);
 
   const loadTasks = () => api("/tasks").then(setTasks).catch((e) => setError(e.message));
 
   useEffect(() => {
     loadTasks();
+    if (convId) api(`/conversations/${convId}/messages`).then(setMessages).catch(() => {});
   }, []);
+  useEffect(() => {
+    endRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages, busy]);
+
+  async function send(text) {
+    text = text.trim();
+    if (!text || busy) return;
+    setInput("");
+    setError("");
+    setMessages((m) => [...m, { role: "user", content: text, suggestions: [] }]);
+    setBusy(true);
+    try {
+      const r = await api("/chat", { method: "POST", body: { message: text, conversation_id: convId } });
+      setConvId(r.conversation_id);
+      localStorage.setItem("conv", r.conversation_id);
+      setMessages((m) => [...m, r.message]);
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      setBusy(false);
+    }
+  }
 
   const toggle = async (t) => {
     await api(`/tasks/${t.id}`, { method: "PATCH", body: { done: !t.done } });
@@ -36,6 +70,11 @@ export default function App() {
     setTitle("");
     loadTasks();
   };
+  const newChat = () => {
+    localStorage.removeItem("conv");
+    setConvId(null);
+    setMessages([]);
+  };
 
   const open = tasks.filter((t) => !t.done);
   const done = tasks.filter((t) => t.done);
@@ -45,14 +84,32 @@ export default function App() {
       <section className="chat" aria-label="Chat">
         <header>
           <h1>TaskPilot</h1>
+          <button className="ghost" onClick={newChat}>New chat</button>
         </header>
 
         <div className="stream">
-          <div className="empty">
-            <p>Tell me what's coming up. I'll turn it into tasks you can approve.</p>
-          </div>
+          {messages.length === 0 && (
+            <div className="empty">
+              <p>Tell me what's coming up. I'll turn it into tasks you can approve.</p>
+              {PROMPTS.map((p) => (
+                <button key={p} className="prompt" onClick={() => send(p)}>{p}</button>
+              ))}
+            </div>
+          )}
+          {messages.map((m, i) => (
+            <div key={i} className={`msg ${m.role}`}>
+              <p>{m.content}</p>
+            </div>
+          ))}
+          {busy && <div className="msg assistant typing" aria-live="polite">Thinking…</div>}
           {error && <div className="error" role="alert">{error}</div>}
+          <div ref={endRef} />
         </div>
+
+        <form className="composer" onSubmit={(e) => { e.preventDefault(); send(input); }}>
+          <input value={input} onChange={(e) => setInput(e.target.value)} placeholder="What do you need to get done?" aria-label="Message" />
+          <button className="primary" disabled={busy || !input.trim()}>Send</button>
+        </form>
       </section>
 
       <aside className="tasks" aria-label="Tasks">
