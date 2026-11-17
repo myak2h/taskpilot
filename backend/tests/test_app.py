@@ -1,9 +1,12 @@
+import json
 import os
 import tempfile
 import unittest
 from unittest.mock import patch
 
+import httpx
 from fastapi.testclient import TestClient
+from openai import OpenAI
 from sqlalchemy import create_engine
 
 _database_dir = tempfile.TemporaryDirectory()
@@ -40,6 +43,46 @@ class AppCompatibilityTest(unittest.TestCase):
         self.assertTrue(updated.json()["done"])
         self.assertIn(task_id, [task["id"] for task in self.client.get("/api/tasks").json()])
         self.assertEqual(self.client.delete(f"/api/tasks/{task_id}").status_code, 204)
+
+    def test_openai_tool_call_round_trip(self):
+        requests = []
+
+        def respond(request):
+            payload = json.loads(request.content)
+            requests.append(payload)
+            if len(requests) == 1:
+                message = {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "suggest_tasks",
+                            "arguments": json.dumps({"tasks": [{"title": "Visit apartments", "priority": "high"}]}),
+                        },
+                    }],
+                }
+            else:
+                message = {"role": "assistant", "content": "Here is your task."}
+            return httpx.Response(200, json={
+                "id": "test-completion",
+                "object": "chat.completion",
+                "created": 0,
+                "model": "test-model",
+                "choices": [{"index": 0, "finish_reason": "stop", "message": message}],
+            })
+
+        with httpx.Client(transport=httpx.MockTransport(respond)) as http_client:
+            with OpenAI(api_key="test-key", http_client=http_client) as openai_client:
+                with patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}), \
+                        patch("openai.OpenAI", return_value=openai_client):
+                    response = self.client.post("/api/chat", json={"message": "Plan apartment visits"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["message"]["suggestions"][0]["title"], "Visit apartments")
+        self.assertEqual(len(requests), 2)
+        self.assertEqual(requests[1]["messages"][-1]["role"], "tool")
 
 
 if __name__ == "__main__":
