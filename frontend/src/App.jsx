@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { updateTaskInMessages, removeTaskFromMessages, reconcileTaskMessages } from "./taskMessages.js";
 
 const api = async (path, opts = {}) => {
   const res = await fetch(`/api${path}`, {
@@ -24,13 +25,29 @@ export default function App() {
   const [title, setTitle] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [pendingTasks, setPendingTasks] = useState(new Set());
+  const pendingTasksRef = useRef(new Set());
+  // null means no authoritative task load has succeeded yet, not an empty list.
+  const loadedTasksRef = useRef(null);
   const endRef = useRef(null);
 
-  const loadTasks = () => api("/tasks").then(setTasks).catch((e) => setError(e.message));
+  const loadTasks = async () => {
+    try {
+      const result = await api("/tasks");
+      loadedTasksRef.current = result;
+      setTasks(result);
+      setMessages((ms) => reconcileTaskMessages(ms, result));
+      return result;
+    } catch (e) {
+      setError(e.message);
+    }
+  };
 
   useEffect(() => {
     loadTasks();
-    if (convId) api(`/conversations/${convId}/messages`).then(setMessages).catch(() => {});
+    if (convId) api(`/conversations/${convId}/messages`).then((ms) => {
+      setMessages(loadedTasksRef.current === null ? ms : reconcileTaskMessages(ms, loadedTasksRef.current));
+    }).catch(() => {});
   }, []);
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -67,12 +84,39 @@ export default function App() {
   }
 
   const toggle = async (t) => {
-    await api(`/tasks/${t.id}`, { method: "PATCH", body: { done: !t.done } });
-    loadTasks();
+    if (pendingTasksRef.current.has(t.id)) return;
+    pendingTasksRef.current.add(t.id);
+    setPendingTasks(new Set(pendingTasksRef.current));
+    setError("");
+    try {
+      const updated = await api(`/tasks/${t.id}`, { method: "PATCH", body: { done: !t.done } });
+      setTasks((ts) => ts.map((task) => task.id === updated.id ? updated : task));
+      setMessages((ms) => updateTaskInMessages(ms, updated));
+      if (loadedTasksRef.current !== null) {
+        loadedTasksRef.current = loadedTasksRef.current.map((task) => task.id === updated.id ? updated : task);
+      }
+      await loadTasks();
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      pendingTasksRef.current.delete(t.id);
+      setPendingTasks(new Set(pendingTasksRef.current));
+    }
   };
   const remove = async (t) => {
-    await api(`/tasks/${t.id}`, { method: "DELETE" });
-    loadTasks();
+    if (pendingTasksRef.current.has(t.id)) return;
+    setError("");
+    try {
+      await api(`/tasks/${t.id}`, { method: "DELETE" });
+      setTasks((ts) => ts.filter((task) => task.id !== t.id));
+      setMessages((ms) => removeTaskFromMessages(ms, t.id));
+      if (loadedTasksRef.current !== null) {
+        loadedTasksRef.current = loadedTasksRef.current.filter((task) => task.id !== t.id);
+      }
+      await loadTasks();
+    } catch (e) {
+      setError(e.message);
+    }
   };
   const addManual = async (e) => {
     e.preventDefault();
@@ -109,7 +153,14 @@ export default function App() {
           )}
           {messages.map((m, i) => (
             <div key={i} className={`msg ${m.role}`}>
-              <p>{m.content}</p>
+              {m.content && <p>{m.content}</p>}
+              {m.tasks?.length > 0 && (
+                <ul className="chat-task-list" aria-label="Existing tasks with completion checkboxes">
+                  {m.tasks.map((t) => (
+                    <Row key={t.id} t={t} toggle={toggle} pending={pendingTasks.has(t.id)} />
+                  ))}
+                </ul>
+              )}
               {m.suggestions?.length > 0 && (
                 <div className="suggest">
                   {m.suggestions.map((s, j) => (
@@ -148,11 +199,11 @@ export default function App() {
           <input value={title} onChange={(e) => setTitle(e.target.value)} placeholder="Add a task" aria-label="New task" />
         </form>
         {open.length === 0 && <p className="hint">No open tasks. Ask the assistant to plan something.</p>}
-        <ul>{open.map((t) => <Row key={t.id} t={t} toggle={toggle} remove={remove} />)}</ul>
+        <ul>{open.map((t) => <Row key={t.id} t={t} toggle={toggle} remove={remove} pending={pendingTasks.has(t.id)} />)}</ul>
         {done.length > 0 && (
           <>
             <h3>Done</h3>
-            <ul>{done.map((t) => <Row key={t.id} t={t} toggle={toggle} remove={remove} />)}</ul>
+            <ul>{done.map((t) => <Row key={t.id} t={t} toggle={toggle} remove={remove} pending={pendingTasks.has(t.id)} />)}</ul>
           </>
         )}
       </aside>
@@ -160,16 +211,16 @@ export default function App() {
   );
 }
 
-function Row({ t, toggle, remove }) {
+function Row({ t, toggle, remove, pending = false }) {
   return (
     <li className={t.done ? "done" : ""}>
-      <input type="checkbox" checked={t.done} onChange={() => toggle(t)} aria-label={`Mark "${t.title}" ${t.done ? "open" : "done"}`} />
+      <input type="checkbox" checked={t.done} disabled={pending} onChange={() => toggle(t)} aria-label={`Mark "${t.title}" ${t.done ? "open" : "done"}`} />
       <span className={`dot ${t.priority}`} title={`${t.priority} priority`} />
       <div className="label">
         <span>{t.title}</span>
         {t.due && <small>Due {t.due}</small>}
       </div>
-      <button className="ghost x" onClick={() => remove(t)} aria-label={`Delete "${t.title}"`}>×</button>
+      {remove && <button className="ghost x" disabled={pending} onClick={() => remove(t)} aria-label={`Delete "${t.title}"`}>×</button>}
     </li>
   );
 }

@@ -57,5 +57,12 @@ li .x { font-size: 18px; line-height: 1; }
 .dot.high { background: var(--high); } .dot.medium { background: var(--medium); } .dot.low { background: var(--low); }
 input[type=checkbox] { accent-color: var(--accent); width: 17px; height: 17px; }
 
+.chat-task-list { margin-top: 10px; min-width: 0; }
+.chat-task-list li { min-width: 0; padding: 8px 0; }
+.chat-task-list li:last-child { border-bottom: 0; }
+.chat-task-list .label { min-width: 0; overflow-wrap: anywhere; }
+.chat-task-list input[type=checkbox] { flex: none; }
+.tasks input[type=checkbox]:disabled, .chat-task-list input[type=checkbox]:disabled { cursor: progress; opacity: .55; }
+
 @media (max-width: 800px) { .app { grid-template-columns: 1fr; grid-template-rows: 1.3fr 1fr; padding: 8px; gap: 8px; } }
 @media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; } }
