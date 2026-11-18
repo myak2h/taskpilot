@@ -6,13 +6,16 @@ actionable tasks. Built with **FastAPI + PostgreSQL + React + an LLM (OpenAI API
 ## How the agent workflow works
 1. User sends a message → `POST /api/chat`.
 2. The LLM runs a small tool-calling loop (`backend/app/agent.py`):
-   - `list_tasks` reads open tasks from the DB (answers "what's on my plate?", avoids duplicates)
-   - `suggest_tasks` returns structured tasks (title, priority, due date)
+   - `list_tasks` reads open tasks from the DB, optionally filtered by exact priority (`low`, `medium`, or `high`). It can display results or use `present_to_user=false` for background planning and duplicate avoidance.
+   - `suggest_tasks` returns structured tasks (title, priority, due date).
+   - The final structured response contains `reply` and a `task_view` decision: `null` for no requested view, or an object with `priority` set to `low`, `medium`, `high`, or `null` for all open tasks. Every request to display existing tasks requires a task view, even when no tasks match.
 3. Suggestions come back with the reply; the user **approves** them with one click, which creates real tasks.
-4. Asking for existing open tasks produces one interactive list with **completion checkboxes** and a short introduction, not a duplicate plaintext enumeration. These attachments reference tasks already added; unlike suggestions, they do not need approval or create new tasks.
+4. The backend resolves the requested task view from the DB into existing task attachments, even without a `list_tasks` call or after a background-only lookup. It uses a short, deterministic introduction instead of displaying a model-generated enumeration. "What's on my plate?", "What are the high priority tasks on my plate?", and "List my low-priority tasks" all use the same interactive list with **completion checkboxes**. Without a priority filter, a new request lists all currently open tasks; with a filter, it lists only matching open tasks. An empty filtered result means there are no matching open tasks, not necessarily that there are no open tasks overall. These attachments reference tasks already added; unlike suggestions, they do not need approval or create new tasks.
 5. Completion and reopening stay synchronized between chat and the sidebar, including repeated listings. Every message (and its suggestions and task references) is persisted, so conversations survive a refresh. Historical attachments show the current task state, including edits and completion; deleted tasks disappear from them. A new request lists only currently open tasks.
 
-No API key? The app falls back to a rule-based **demo mode** so it still runs end to end, including interactive lists of existing tasks. Try "What's on my plate?" after adding tasks. The agent never creates or completes tasks itself; you approve suggestions and control completion in the UI.
+No API key? The app falls back to a rule-based **demo mode** so it still runs end to end, including interactive lists of existing tasks. It recognizes common listing forms such as "What's on my plate?", "Show my tasks", "List my tasks", "Which tasks are on my plate?", and "What are my tasks?", along with priority-qualified forms such as "What are the high priority tasks on my plate?" and "List my low-priority tasks". Priority matching is case-insensitive and accepts forms such as "high-priority". These are supported patterns, not arbitrary natural-language understanding offline. Ordinary task-creation phrases such as "Buy milk and call mom" produce suggestions rather than listings. The agent never creates or completes tasks itself; you approve suggestions and control completion in the UI.
+
+The structured task-view decision is internal: the public message fields (`id`, `role`, `content`, `suggestions`, and `tasks`) are unchanged. Persistence, completion synchronization, suggestion approval requirements, and historical attachment behavior are unchanged as well.
 
 ## Stack
 - Backend: Python, FastAPI, SQLAlchemy, OpenAI SDK
