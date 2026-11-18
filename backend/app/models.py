@@ -29,3 +29,9 @@ class Message(Base):
     content: Mapped[str] = mapped_column(Text)
     suggestions: Mapped[list] = mapped_column(JSON, default=list)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class MessageTask(Base):
+    __tablename__ = "message_tasks"
+    message_id: Mapped[int] = mapped_column(ForeignKey("messages.id"), primary_key=True)
+    task_id: Mapped[int] = mapped_column(ForeignKey("tasks.id"), primary_key=True)

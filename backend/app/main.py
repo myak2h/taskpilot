@@ -37,8 +37,13 @@ def task_out(t: models.Task) -> dict:
             "due": t.due, "done": t.done}
 
 
-def msg_out(m: models.Message) -> dict:
-    return {"id": m.id, "role": m.role, "content": m.content, "suggestions": m.suggestions or []}
+def msg_out(m: models.Message, db: Session) -> dict:
+    tasks = (db.query(models.Task)
+             .join(models.MessageTask, models.MessageTask.task_id == models.Task.id)
+             .filter(models.MessageTask.message_id == m.id)
+             .order_by(models.Task.id).all())
+    return {"id": m.id, "role": m.role, "content": m.content, "suggestions": m.suggestions or [],
+            "tasks": [task_out(t) for t in tasks]}
 
 
 @app.get("/api/health")
@@ -78,6 +83,7 @@ def update_task(task_id: int, body: TaskPatch, db: Session = Depends(get_db)):
 def delete_task(task_id: int, db: Session = Depends(get_db)):
     t = db.get(models.Task, task_id)
     if t:
+        db.query(models.MessageTask).filter_by(task_id=task_id).delete()
         db.delete(t)
         db.commit()
 
@@ -97,18 +103,22 @@ def chat(body: ChatIn, db: Session = Depends(get_db)):
 
     db.add(models.Message(conversation_id=convo.id, role="user", content=body.message))
     try:
-        reply, suggestions = run_agent(db, history, body.message)
+        reply, suggestions, presented_task_ids = run_agent(db, history, body.message)
     except Exception as e:  # LLM/network failure
         db.rollback()
         raise HTTPException(502, f"The AI service failed: {e}")
     m = models.Message(conversation_id=convo.id, role="assistant", content=reply, suggestions=suggestions)
     db.add(m)
+    db.flush()
+    for task_id in dict.fromkeys(presented_task_ids):
+        if db.get(models.Task, task_id) is not None:
+            db.add(models.MessageTask(message_id=m.id, task_id=task_id))
     db.commit()
     db.refresh(m)
-    return {"conversation_id": convo.id, "message": msg_out(m)}
+    return {"conversation_id": convo.id, "message": msg_out(m, db)}
 
 
 @app.get("/api/conversations/{cid}/messages")
 def messages(cid: int, db: Session = Depends(get_db)):
     rows = db.query(models.Message).filter_by(conversation_id=cid).order_by(models.Message.id).all()
-    return [msg_out(m) for m in rows]
+    return [msg_out(m, db) for m in rows]
