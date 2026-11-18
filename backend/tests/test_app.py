@@ -18,6 +18,10 @@ from app.db import Base, get_db
 from app.main import app
 
 
+def final_message(reply, task_view=None):
+    return {"role": "assistant", "content": json.dumps({"reply": reply, "task_view": task_view})}
+
+
 class AppCompatibilityTest(unittest.TestCase):
     def setUp(self):
         self.client = TestClient(app)
@@ -67,7 +71,7 @@ class AppCompatibilityTest(unittest.TestCase):
                     }],
                 }
             else:
-                message = {"role": "assistant", "content": "Here is your task."}
+                message = final_message("Here is your task.")
             return httpx.Response(200, json={
                 "id": "test-completion",
                 "object": "chat.completion",
@@ -84,6 +88,7 @@ class AppCompatibilityTest(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["message"]["suggestions"][0]["title"], "Visit apartments")
+        self.assertEqual(response.json()["message"]["content"], "Here is your task.")
         self.assertEqual(len(requests), 2)
         self.assertEqual(requests[1]["messages"][-1]["role"], "tool")
 
@@ -124,6 +129,15 @@ class ChatTaskAttachmentTest(unittest.TestCase):
         response = self.client.patch(f"/api/tasks/{completed['id']}", json={"done": True})
         self.assertEqual(response.status_code, 200)
         return first, second, response.json()
+
+    def seed_priority_tasks(self):
+        first, second, completed = self.seed_tasks()
+        medium = self.create_task("Review lighting plan", priority="medium")
+        high = self.create_task("Confirm venue insurance", priority="high")
+        completed_high = self.create_task("Submit old permit", priority="high")
+        response = self.client.patch(f"/api/tasks/{completed_high['id']}", json={"done": True})
+        self.assertEqual(response.status_code, 200)
+        return [first, second, medium, high], [completed, response.json()]
 
     def task_snapshot(self):
         response = self.client.get("/api/tasks")
@@ -167,7 +181,44 @@ class ChatTaskAttachmentTest(unittest.TestCase):
     def tool_message(self, *calls):
         return {"role": "assistant", "content": None, "tool_calls": list(calls)}
 
-    def openai_chat(self, replies, text="Show my tasks"):
+    def assert_response_format(self, request):
+        response_format = request["response_format"]
+        self.assertEqual(response_format["type"], "json_schema")
+        self.assertIs(response_format["json_schema"]["strict"], True)
+        schema = response_format["json_schema"]["schema"]
+        self.assertEqual(schema["type"], "object")
+        self.assertEqual(set(schema["required"]), {"reply", "task_view"})
+        self.assertEqual(set(schema["properties"]), {"reply", "task_view"})
+        self.assertEqual(schema["properties"]["reply"], {"type": "string"})
+        variants = schema["properties"]["task_view"]["anyOf"]
+        self.assertEqual(len(variants), 2)
+        self.assertIn({"type": "null"}, variants)
+        view = next(variant for variant in variants if variant["type"] == "object")
+        self.assertEqual(view["required"], ["priority"])
+        self.assertEqual(set(view["properties"]), {"priority"})
+        priority = view["properties"]["priority"]
+        self.assertEqual(set(priority["type"]), {"string", "null"})
+        self.assertEqual(set(priority["enum"]), {"low", "medium", "high", None})
+
+        def assert_strict_objects(node):
+            if isinstance(node, dict):
+                if node.get("type") == "object":
+                    self.assertIs(node["additionalProperties"], False)
+                for value in node.values():
+                    assert_strict_objects(value)
+            elif isinstance(node, list):
+                for value in node:
+                    assert_strict_objects(value)
+
+        assert_strict_objects(schema)
+        tool = next(tool["function"] for tool in request["tools"]
+                    if tool["function"]["name"] == "list_tasks")
+        self.assertEqual(tool["parameters"]["properties"]["priority"]["type"], "string")
+        self.assertEqual(set(tool["parameters"]["properties"]["priority"]["enum"]),
+                         {"low", "medium", "high"})
+        self.assertNotIn("priority", tool["parameters"].get("required", []))
+
+    def openai_chat(self, replies, text="Show my tasks", expected_status=200):
         requests = []
 
         def respond(request):
@@ -191,8 +242,10 @@ class ChatTaskAttachmentTest(unittest.TestCase):
                 with patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}), \
                         patch("openai.OpenAI", return_value=openai_client):
                     response = self.client.post("/api/chat", json={"message": text})
-        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.status_code, expected_status, response.text)
         self.assertEqual(len(requests), len(replies))
+        for request in requests:
+            self.assert_response_format(request)
         return response.json(), requests
 
     def assert_tool_tasks(self, request, call_id, tasks):
@@ -251,6 +304,38 @@ class ChatTaskAttachmentTest(unittest.TestCase):
         self.assertEqual(self.history(result["conversation_id"])[-1], message)
         self.assertEqual(self.task_snapshot(), before)
 
+    def test_demo_priority_listing_and_paraphrases(self):
+        tasks, completed = self.seed_priority_tasks()
+        before = self.task_snapshot()
+        cases = [
+            ("what are the high priority tasks on my plate?", "high"),
+            ("SHOW MY HIGH-PRIORITY TASKS", "high"),
+            ("List my low-priority tasks", "low"),
+            ("Which medium priority tasks are open?", "medium"),
+            ("show my tasks", None),
+            ("list my tasks", None),
+            ("Which tasks are on my plate?", None),
+            ("what are my tasks?", None),
+            ("What's on my plate?", None),
+        ]
+        introductions = {}
+        for text, priority in cases:
+            with self.subTest(text=text):
+                expected = [task for task in tasks if priority is None or task["priority"] == priority]
+                result = self.demo_chat(text)
+                message = result["message"]
+                self.assert_listing(message, expected)
+                if priority:
+                    self.assertIn(priority, message["content"].lower())
+                for task in tasks + completed:
+                    self.assertNotIn(task["title"], message["content"])
+                self.assert_references(message["id"], expected)
+                self.assertEqual(self.history(result["conversation_id"])[-1], message)
+                self.assertEqual(self.task_snapshot(), before)
+                if priority in introductions:
+                    self.assertEqual(message["content"], introductions[priority])
+                introductions[priority] = message["content"]
+
     def test_demo_suggestions_and_conversation_have_no_attachments(self):
         self.seed_tasks()
         before = self.task_snapshot()
@@ -264,6 +349,20 @@ class ChatTaskAttachmentTest(unittest.TestCase):
         self.assertEqual(conversational["message"]["suggestions"], [])
         self.assertEqual(conversational["message"]["tasks"], [])
         self.assertEqual(self.task_snapshot(), before)
+
+    def test_demo_creation_phrases_are_not_listings(self):
+        self.seed_priority_tasks()
+        before = self.task_snapshot()
+        for text in ("Buy milk and call mom", "Plan high-priority tasks for the launch",
+                     "Create a list of supplies", "Write my tasks for tomorrow and buy groceries"):
+            with self.subTest(text=text):
+                result = self.demo_chat(text)
+                message = result["message"]
+                self.assertTrue(message["suggestions"])
+                self.assertEqual(message["tasks"], [])
+                self.assert_references(message["id"], [])
+                self.assertEqual(self.history(result["conversation_id"])[-1], message)
+                self.assertEqual(self.task_snapshot(), before)
 
     def test_legacy_message_has_empty_attachments(self):
         self.seed_tasks()
@@ -292,7 +391,7 @@ class ChatTaskAttachmentTest(unittest.TestCase):
             with self.subTest(arguments=arguments):
                 result, requests = self.openai_chat([
                     self.tool_message(self.tool_call("list_1", "list_tasks", arguments)),
-                    {"role": "assistant", "content": f"Your tasks: {first['title']}; {second['title']}."},
+                    final_message(f"Your tasks: {first['title']}; {second['title']}."),
                 ])
                 message = result["message"]
                 self.assert_listing(message, [first, second])
@@ -313,7 +412,7 @@ class ChatTaskAttachmentTest(unittest.TestCase):
                 self.tool_call("list_2", "list_tasks", {"present_to_user": True}),
             ),
             self.tool_message(self.tool_call("list_3", "list_tasks", {})),
-            {"role": "assistant", "content": f"Remember {first['title']} and {second['title']}."},
+            final_message(f"Remember {first['title']} and {second['title']}."),
         ])
         message = result["message"]
         self.assert_listing(message, [first, second])
@@ -324,6 +423,130 @@ class ChatTaskAttachmentTest(unittest.TestCase):
         self.assertEqual(self.history(result["conversation_id"])[-1], message)
         self.assertEqual(self.task_snapshot(), before)
 
+    def test_openai_filtered_tools_and_repeated_visible_fallback(self):
+        tasks, completed = self.seed_priority_tasks()
+        before = self.task_snapshot()
+        for priority in ("low", "medium", "high"):
+            with self.subTest(priority=priority):
+                expected = [task for task in tasks if task["priority"] == priority]
+                result, requests = self.openai_chat([
+                    self.tool_message(
+                        self.tool_call("filtered_1", "list_tasks", {"priority": priority}),
+                        self.tool_call("filtered_2", "list_tasks",
+                                       {"priority": priority, "present_to_user": True}),
+                    ),
+                    self.tool_message(self.tool_call("filtered_3", "list_tasks", {"priority": priority})),
+                    final_message("Model prose must not replace the task view."),
+                ], text=f"List my {priority}-priority tasks")
+                message = result["message"]
+                self.assert_listing(message, expected)
+                self.assertIn(priority, message["content"].lower())
+                for task in tasks + completed:
+                    self.assertNotIn(task["title"], message["content"])
+                self.assert_tool_tasks(requests[1], "filtered_1", expected)
+                self.assert_tool_tasks(requests[1], "filtered_2", expected)
+                self.assert_tool_tasks(requests[2], "filtered_3", expected)
+                self.assert_references(message["id"], expected)
+                self.assertEqual(self.history(result["conversation_id"])[-1], message)
+                self.assertEqual(self.task_snapshot(), before)
+
+    def test_openai_structured_views_without_visible_lookup(self):
+        tasks, completed = self.seed_priority_tasks()
+        before = self.task_snapshot()
+        for priority in ("high", "low", "medium", None):
+            expected = [task for task in tasks if priority is None or task["priority"] == priority]
+            text = ("what are the high priority tasks on my plate?" if priority == "high" else
+                    "What's on my plate?" if priority is None else f"List my {priority}-priority tasks")
+            introductions = []
+            for lookup in ("none", "background", "broader_visible"):
+                with self.subTest(priority=priority, lookup=lookup):
+                    replies = []
+                    if lookup != "none":
+                        replies.append(self.tool_message(self.tool_call(
+                            "lookup", "list_tasks", {"present_to_user": lookup == "broader_visible"}
+                        )))
+                    replies.append(final_message(
+                        "; ".join(task["title"] for task in tasks + completed), {"priority": priority}
+                    ))
+                    result, requests = self.openai_chat(replies, text=text)
+                    message = result["message"]
+                    self.assert_listing(message, expected)
+                    if priority:
+                        self.assertIn(priority, message["content"].lower())
+                    for task in tasks + completed:
+                        self.assertNotIn(task["title"], message["content"])
+                    if lookup != "none":
+                        self.assert_tool_tasks(requests[1], "lookup", tasks)
+                    self.assert_references(message["id"], expected)
+                    self.assertEqual(self.history(result["conversation_id"])[-1], message)
+                    self.assertEqual(self.task_snapshot(), before)
+                    introductions.append(message["content"])
+            self.assertEqual(len(set(introductions)), 1)
+
+    def test_openai_structured_filtered_view_preserves_separate_suggestions(self):
+        tasks, completed = self.seed_priority_tasks()
+        before = self.task_snapshot()
+        expected = [task for task in tasks if task["priority"] == "high"]
+        suggestion = {"title": "Draft safety checklist", "notes": "", "priority": "low", "due": None}
+        result, requests = self.openai_chat([
+            self.tool_message(
+                self.tool_call("background", "list_tasks", {"priority": "high", "present_to_user": False}),
+                self.tool_call("suggest", "suggest_tasks", {"tasks": [suggestion]}),
+            ),
+            final_message("Here are tasks and a suggestion.", {"priority": "high"}),
+        ], text="what are the high priority tasks on my plate?")
+        message = result["message"]
+        self.assert_listing(message, expected, [suggestion])
+        self.assertIn("high", message["content"].lower())
+        self.assertIn("add", message["content"].lower())
+        for task in tasks + completed + [suggestion]:
+            self.assertNotIn(task["title"], message["content"])
+        self.assert_tool_tasks(requests[1], "background", expected)
+        self.assert_references(message["id"], expected)
+        self.assertEqual(self.history(result["conversation_id"])[-1], message)
+        self.assertEqual(self.task_snapshot(), before)
+
+    def test_filtered_empty_results_do_not_claim_all_tasks_are_done(self):
+        self.create_task("Keep the low priority task", priority="low")
+        completed = self.create_task("Finished urgent task", priority="high")
+        response = self.client.patch(f"/api/tasks/{completed['id']}", json={"done": True})
+        self.assertEqual(response.status_code, 200)
+        before = self.task_snapshot()
+        text = "what are the high priority tasks on my plate?"
+        results = [self.demo_chat(text)]
+        for lookup in ("none", "background", "visible", "broader_visible"):
+            with self.subTest(lookup=lookup):
+                replies = []
+                if lookup != "none":
+                    arguments = {"priority": "high", "present_to_user": lookup != "background"}
+                    if lookup == "broader_visible":
+                        arguments = {}
+                    replies.append(self.tool_message(self.tool_call("empty", "list_tasks", arguments)))
+                replies.append(final_message("No tasks anywhere.", {"priority": "high"}))
+                result, requests = self.openai_chat(replies, text=text)
+                if lookup in ("background", "visible"):
+                    self.assert_tool_tasks(requests[1], "empty", [])
+                results.append(result)
+        fallback, requests = self.openai_chat([
+            self.tool_message(self.tool_call("empty", "list_tasks", {"priority": "high"})),
+            final_message("No tasks anywhere."),
+        ], text=text)
+        self.assert_tool_tasks(requests[1], "empty", [])
+        results.append(fallback)
+        for result in results:
+            message = result["message"]
+            self.assertEqual(message["tasks"], [])
+            self.assertEqual(message["suggestions"], [])
+            self.assertIn("high", message["content"].lower())
+            self.assertIn("no open", message["content"].lower())
+            self.assertNotIn("no open tasks", message["content"].lower())
+            for task in before:
+                self.assertNotIn(task["title"], message["content"])
+            self.assert_references(message["id"], [])
+            self.assertEqual(self.history(result["conversation_id"])[-1], message)
+            self.assertEqual(self.task_snapshot(), before)
+        self.assertEqual(len({result["message"]["content"] for result in results}), 1)
+
     def test_openai_background_lookup_preserves_reply_and_suggestions(self):
         first, second, _ = self.seed_tasks()
         before = self.task_snapshot()
@@ -333,7 +556,7 @@ class ChatTaskAttachmentTest(unittest.TestCase):
         result, requests = self.openai_chat([
             self.tool_message(self.tool_call("background", "list_tasks", {"present_to_user": False})),
             self.tool_message(self.tool_call("suggest", "suggest_tasks", {"tasks": [suggestion]})),
-            {"role": "assistant", "content": reply},
+            final_message(reply),
         ], text="Plan my concert trip without duplicating existing tasks")
         message = result["message"]
         self.assertEqual(message["content"], reply)
@@ -353,7 +576,7 @@ class ChatTaskAttachmentTest(unittest.TestCase):
                 self.tool_call("visible", "list_tasks", {"present_to_user": True}),
                 self.tool_call("suggest", "suggest_tasks", {"tasks": [suggestion]}),
             ),
-            {"role": "assistant", "content": f"{first['title']}, {second['title']}, and {suggestion['title']}."},
+            final_message(f"{first['title']}, {second['title']}, and {suggestion['title']}."),
         ])
         message = result["message"]
         self.assert_listing(message, [first, second], [suggestion])
@@ -371,7 +594,7 @@ class ChatTaskAttachmentTest(unittest.TestCase):
                     calls.append(self.tool_call("suggest", "suggest_tasks", {"tasks": suggestions}))
                 result, requests = self.openai_chat([
                     self.tool_message(*calls),
-                    {"role": "assistant", "content": "Here is a long, irrelevant planning response."},
+                    final_message("Here is a long, irrelevant planning response."),
                 ])
                 message = result["message"]
                 self.assertEqual(message["tasks"], [])
@@ -406,12 +629,41 @@ class ChatTaskAttachmentTest(unittest.TestCase):
         self.seed_tasks()
         before = self.task_snapshot()
         reply = "Hello! How can I help?"
-        result, _ = self.openai_chat([{"role": "assistant", "content": reply}], text="Hello")
+        result, _ = self.openai_chat([final_message(reply)], text="Hello")
         message = result["message"]
         self.assertEqual(message["content"], reply)
         self.assertEqual(message["suggestions"], [])
         self.assertEqual(message["tasks"], [])
         self.assertEqual(self.task_snapshot(), before)
+
+    def test_openai_malformed_structured_output_returns_502(self):
+        self.seed_priority_tasks()
+        before = self.task_snapshot()
+        malformed = [
+            "Your tasks: Inspect rooftop garden; Reserve rehearsal room.",
+            "{",
+            json.dumps({"reply": "Your tasks"}),
+            json.dumps({"reply": "Your tasks", "task_view": {}}),
+            json.dumps({"reply": "Your tasks", "task_view": {"priority": "urgent"}}),
+            json.dumps({"reply": "Your tasks", "task_view": {"priority": "high", "extra": True}}),
+            json.dumps({"reply": "Your tasks", "task_view": None, "extra": True}),
+            json.dumps({"reply": ["Inspect rooftop garden"], "task_view": None}),
+            json.dumps(["Inspect rooftop garden"]),
+        ]
+        for content in malformed:
+            for visible in (False, True):
+                with self.subTest(content=content, visible=visible):
+                    replies = []
+                    if visible:
+                        replies.append(self.tool_message(self.tool_call("visible", "list_tasks", {})))
+                    replies.append({"role": "assistant", "content": content})
+                    result, _ = self.openai_chat(replies, expected_status=502)
+                    self.assertIn("The AI service failed:", result["detail"])
+                    self.assertNotIn("message", result)
+                    self.assertEqual(self.task_snapshot(), before)
+                    with self.session_factory() as db:
+                        self.assertEqual(db.query(models.MessageTask).count(), 0)
+                        self.assertEqual(db.query(models.Message).filter_by(role="assistant").count(), 0)
 
 
 if __name__ == "__main__":

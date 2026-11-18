@@ -29,6 +29,11 @@ TOOLS = [
                         "type": "boolean",
                         "default": True,
                         "description": "Show the tasks to the user (default true). Set false for a background lookup for planning or duplicate avoidance.",
+                    },
+                    "priority": {
+                        "type": "string",
+                        "enum": ["low", "medium", "high"],
+                        "description": "Only return open tasks with this exact priority. Omit for all open tasks.",
                     }
                 },
             },
@@ -62,6 +67,38 @@ TOOLS = [
     },
 ]
 
+RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "task_response",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "reply": {"type": "string"},
+                "task_view": {
+                    "anyOf": [
+                        {
+                            "type": "object",
+                            "properties": {
+                                "priority": {
+                                    "type": ["string", "null"],
+                                    "enum": ["low", "medium", "high", None],
+                                }
+                            },
+                            "required": ["priority"],
+                            "additionalProperties": False,
+                        },
+                        {"type": "null"},
+                    ]
+                },
+            },
+            "required": ["reply", "task_view"],
+            "additionalProperties": False,
+        },
+    },
+}
+
 
 def _system_prompt() -> str:
     return (
@@ -69,30 +106,65 @@ def _system_prompt() -> str:
         f"Today is {date.today().isoformat()}. "
         "When the user describes things they need to do, call suggest_tasks with clear, verb-first tasks "
         "(break big items down, infer sensible priorities and due dates). "
-        "When they ask to see existing tasks or what's on their plate, call list_tasks with present_to_user=true. "
-        "For background lookups for planning or duplicate avoidance, use present_to_user=false. "
-        "Visible listings are attached as interactive task lists with completion checkboxes; "
-        "never enumerate attached task titles in prose. "
+        "Return a final JSON object with reply and task_view. Every request to display existing tasks, "
+        "regardless of wording or priority qualifier, must return a non-null task_view, even when no tasks match. "
+        "Set task_view to {\"priority\": null} for all open tasks, or set its priority to low, medium, or high "
+        "for the requested priority. The backend resolves this selection into interactive tasks with completion "
+        "checkboxes; reply must never enumerate those tasks. "
+        "For example, \"What's on my plate?\" requires task_view={\"priority\": null}; "
+        "\"what are the high priority tasks on my plate?\" requires task_view={\"priority\": \"high\"}; "
+        "\"List my low-priority tasks\" requires task_view={\"priority\": \"low\"}. "
+        "Keep list_tasks available to inspect current tasks: when displaying them, use present_to_user=true "
+        "and the requested priority filter, if any. For background lookups for planning or duplicate avoidance, "
+        "use present_to_user=false. A background lookup alone does not mean the user wants a task view. "
+        "Distinguish displaying existing tasks from proposing new ones: \"Buy milk and call mom\" requests "
+        "suggestions, not a task_view. Use task_view=null when no display of existing tasks is requested. "
+        "A request can ask for both an existing task view and new suggestions. "
         "Never create or complete tasks yourself; the user approves suggestions and marks tasks done in the UI. "
         "For anything else, just reply conversationally. "
         "After suggesting, write a short reply (1-3 sentences) and mention they can add the tasks with one click."
     )
 
 
-def _open_tasks(db: Session) -> list[dict]:
-    rows = db.query(models.Task).filter_by(done=False).order_by(models.Task.id).all()
+def _open_tasks(db: Session, priority: str | None = None) -> list[dict]:
+    query = db.query(models.Task).filter_by(done=False)
+    if priority is not None:
+        query = query.filter_by(priority=priority)
+    rows = query.order_by(models.Task.id).all()
     return [{"id": t.id, "title": t.title, "priority": t.priority, "due": t.due} for t in rows]
 
 
-def _listing_reply(task_ids: list[int], suggestions: list[dict]) -> str:
-    reply = (
-        "Here are your open tasks. Use the completion checkboxes to mark them done."
-        if task_ids else
-        "You have no open tasks. Tell me what's coming up and I'll plan it."
-    )
+def _listing_reply(task_ids: list[int], suggestions: list[dict], priority: str | None = None) -> str:
+    if priority is not None:
+        reply = (
+            f"Here are your open {priority}-priority tasks. Use the completion checkboxes to mark them done."
+            if task_ids else
+            f"You have no open {priority}-priority tasks. Tasks of other priorities may still be open."
+        )
+    else:
+        reply = (
+            "Here are your open tasks. Use the completion checkboxes to mark them done."
+            if task_ids else
+            "You have no open tasks. Tell me what's coming up and I'll plan it."
+        )
     if suggestions:
         reply += " You can add any of the suggested tasks with one click."
     return reply
+
+
+def _parse_response(content: str) -> dict:
+    result = json.loads(content)
+    if not isinstance(result, dict) or set(result) != {"reply", "task_view"}:
+        raise ValueError("Invalid structured task response")
+    if not isinstance(result["reply"], str):
+        raise ValueError("Structured reply must be a string")
+    task_view = result["task_view"]
+    if task_view is not None:
+        if not isinstance(task_view, dict) or set(task_view) != {"priority"}:
+            raise ValueError("Invalid structured task view")
+        if task_view["priority"] not in ("low", "medium", "high", None):
+            raise ValueError("Invalid task view priority")
+    return result
 
 
 def run_agent(db: Session, history: list[dict], user_text: str) -> tuple[str, list[dict], list[int]]:
@@ -108,23 +180,36 @@ def run_agent(db: Session, history: list[dict], user_text: str) -> tuple[str, li
     presented_task_ids: list[int] = []
     seen_task_ids: set[int] = set()
     visible_listing = False
+    listing_priority: str | None = None
 
     def finalize(reply: str) -> tuple[str, list[dict], list[int]]:
         if visible_listing:
-            reply = _listing_reply(presented_task_ids, suggestions)
+            reply = _listing_reply(presented_task_ids, suggestions, listing_priority)
         return reply, suggestions, presented_task_ids
 
     for _ in range(3):  # small tool-calling loop
-        resp = client.chat.completions.create(model=MODEL, messages=messages, tools=TOOLS)
+        resp = client.chat.completions.create(
+            model=MODEL, messages=messages, tools=TOOLS, response_format=RESPONSE_FORMAT
+        )
         msg = resp.choices[0].message
         if not msg.tool_calls:
-            return finalize(msg.content or "")
+            result = _parse_response(msg.content or "")
+            if result["task_view"] is not None:
+                listing_priority = result["task_view"]["priority"]
+                presented_task_ids = [task["id"] for task in _open_tasks(db, listing_priority)]
+                visible_listing = True
+            return finalize(result["reply"])
         messages.append(msg)
         for call in msg.tool_calls:
             args = json.loads(call.function.arguments or "{}")
             if call.function.name == "list_tasks":
-                tasks = _open_tasks(db)
+                priority = args.get("priority")
+                tasks = _open_tasks(db, priority)
                 if args.get("present_to_user", True):
+                    if not visible_listing:
+                        listing_priority = priority
+                    elif listing_priority != priority:
+                        listing_priority = None
                     visible_listing = True
                     for task in tasks:
                         if task["id"] not in seen_task_ids:
@@ -151,10 +236,20 @@ def _clean(t: dict) -> dict:
 def _demo_agent(db: Session, text: str) -> tuple[str, list[dict], list[int]]:
     """Offline fallback so the app can be demoed without an API key."""
     low = text.lower()
-    if re.search(r"what('s| is| do i have)|my tasks|on my plate", low):
-        tasks = _open_tasks(db)
+    if re.search(
+        r"\bwhat('s| is| do i have)\b|"
+        r"\b(?:show|list)\s+(?:(?:me|all|of|my|the|open|current|low|medium|high|priority)[\s-]+)*tasks\b|"
+        r"\bwhich\s+(?:(?:of|my|the|open|current|low|medium|high|priority)[\s-]+)*tasks\b|"
+        r"\bwhat are\s+(?:(?:all|of|my|the|open|current|low|medium|high|priority)[\s-]+)*tasks\b|"
+        r"\b(?:show|list)\b.*\bon my plate\b|^\s*on my plate\b|"
+        r"^\s*my\s+(?:(?:open|current|low|medium|high|priority)[\s-]+)*tasks\b",
+        low,
+    ):
+        match = re.search(r"\b(low|medium|high)[\s-]+priority\b", low)
+        priority = match.group(1) if match else None
+        tasks = _open_tasks(db, priority)
         task_ids = [t["id"] for t in tasks]
-        return _listing_reply(task_ids, []), [], task_ids
+        return _listing_reply(task_ids, [], priority), [], task_ids
     parts = [p.strip(" .") for p in re.split(r",|;|\band\b|\bthen\b", text) if len(p.strip()) > 3]
     if not parts:
         return "Tell me what you need to get done and I'll turn it into tasks.", [], []
