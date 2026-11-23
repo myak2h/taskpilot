@@ -99,7 +99,8 @@ appear in the same message and are empty when unused. Task attachments do not
 create tasks, and deleting a task removes it from historical attachments.
 
 ## Validation
-After installing the dependencies above, run each block from the repository root:
+After installing the backend dependencies above, run the backend tests from the
+repository root:
 
 ```bash
 cd backend
@@ -107,11 +108,45 @@ source .venv/bin/activate
 python -m unittest discover -s tests
 ```
 
+For frontend validation, use the supported Node version noted above (Node 20.19+
+within 20.x, or 22.12+). From the repository root:
+
 ```bash
 cd frontend
+node --version
+npm install
 npm test
 npm run build
 ```
+
+`npm test` is the non-watch command: it runs both the Node task-message helper
+tests and the Vitest UI tests. From `frontend`, you can also run them separately:
+
+- `npm run test:unit` — Node helper tests (`node --test src/taskMessages.test.js`).
+- `npm run test:ui` — Vitest UI tests once (`vitest run`).
+- `npm run test:watch` — Vitest UI tests in watch mode (`vitest`).
+
+The frontend tests run in jsdom with mocked `fetch` responses. They require no
+backend, database, API key, Docker, or OpenAI connection. Dependency installation
+still requires package availability, such as access to the npm registry or a
+populated local cache.
+
+The regression suite covers conversation restoration and task reconciliation,
+message sending, individual and batch suggestion approval, manual task creation,
+completion/reopening and deletion across chat and sidebar, and failed requests
+with retries. Deferred responses exercise duplicate submissions and New chat
+races without contacting a live service.
+
+Pending mutations cannot be submitted twice. Failed creation remains retryable
+and preserves the manual title or unsuccessful suggestions; partially approved
+batches retain only unsuccessful or unattempted suggestions, so retrying does
+not recreate successful items. New chat ignores late responses from the discarded
+conversation without cancelling valid task persistence or clearing the sidebar.
+
+New UI tests belong in `.test.jsx` files; Vitest deliberately excludes the
+existing `node:test` helper suite. Register every expected API response with the
+test API helpers in `frontend/src/test/api.js`: unexpected requests fail the
+suite, even if the app catches the error, and never fall back to the network.
 
 ## Next steps (phase 2 ideas)
 Auth and per-user data, streaming responses, Alembic migrations, calendar sync, recurring tasks.
