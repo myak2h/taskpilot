@@ -27,6 +27,8 @@ export default function App() {
   const [error, setError] = useState("");
   const [pendingTasks, setPendingTasks] = useState(new Set());
   const pendingTasksRef = useRef(new Set());
+  const conversationGenerationRef = useRef(0);
+  const sendPendingRef = useRef(false);
   // null means no authoritative task load has succeeded yet, not an empty list.
   const loadedTasksRef = useRef(null);
   const endRef = useRef(null);
@@ -44,10 +46,14 @@ export default function App() {
   };
 
   useEffect(() => {
+    let active = true;
+    const generation = conversationGenerationRef.current;
     loadTasks();
     if (convId) api(`/conversations/${convId}/messages`).then((ms) => {
+      if (!active || generation !== conversationGenerationRef.current) return;
       setMessages(loadedTasksRef.current === null ? ms : reconcileTaskMessages(ms, loadedTasksRef.current));
     }).catch(() => {});
+    return () => { active = false; };
   }, []);
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -55,20 +61,27 @@ export default function App() {
 
   async function send(text) {
     text = text.trim();
-    if (!text || busy) return;
+    if (!text || sendPendingRef.current) return;
+    const generation = conversationGenerationRef.current;
+    const conversationId = convId;
+    sendPendingRef.current = true;
     setInput("");
     setError("");
     setMessages((m) => [...m, { role: "user", content: text, suggestions: [] }]);
     setBusy(true);
     try {
-      const r = await api("/chat", { method: "POST", body: { message: text, conversation_id: convId } });
+      const r = await api("/chat", { method: "POST", body: { message: text, conversation_id: conversationId } });
+      if (generation !== conversationGenerationRef.current) return;
       setConvId(r.conversation_id);
       localStorage.setItem("conv", r.conversation_id);
       setMessages((m) => [...m, r.message]);
     } catch (e) {
-      setError(e.message);
+      if (generation === conversationGenerationRef.current) setError(e.message);
     } finally {
-      setBusy(false);
+      if (generation === conversationGenerationRef.current) {
+        sendPendingRef.current = false;
+        setBusy(false);
+      }
     }
   }
 
@@ -126,9 +139,14 @@ export default function App() {
     loadTasks();
   };
   const newChat = () => {
+    conversationGenerationRef.current += 1;
     localStorage.removeItem("conv");
     setConvId(null);
     setMessages([]);
+    setInput("");
+    setError("");
+    sendPendingRef.current = false;
+    setBusy(false);
   };
 
   const open = tasks.filter((t) => !t.done);
