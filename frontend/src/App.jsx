@@ -27,13 +27,17 @@ export default function App() {
   const [error, setError] = useState("");
   const [pendingTasks, setPendingTasks] = useState(new Set());
   const pendingTasksRef = useRef(new Set());
+  const [creating, setCreating] = useState(false);
+  const createPendingRef = useRef(false);
+  const [pendingApprovals, setPendingApprovals] = useState(new Set());
+  const pendingApprovalsRef = useRef(new Map());
   const conversationGenerationRef = useRef(0);
   const sendPendingRef = useRef(false);
   // null means no authoritative task load has succeeded yet, not an empty list.
   const loadedTasksRef = useRef(null);
   const endRef = useRef(null);
 
-  const loadTasks = async () => {
+  const loadTasks = async (generation = null) => {
     try {
       const result = await api("/tasks");
       loadedTasksRef.current = result;
@@ -41,7 +45,7 @@ export default function App() {
       setMessages((ms) => reconcileTaskMessages(ms, result));
       return result;
     } catch (e) {
-      setError(e.message);
+      if (generation === null || generation === conversationGenerationRef.current) setError(e.message);
     }
   };
 
@@ -85,15 +89,40 @@ export default function App() {
     }
   }
 
-  async function addTasks(msgIndex, picks) {
-    for (const t of picks) await api("/tasks", { method: "POST", body: t });
-    // mark those suggestions as added in the UI
-    setMessages((ms) =>
-      ms.map((m, i) =>
-        i === msgIndex ? { ...m, suggestions: m.suggestions.filter((s) => !picks.includes(s)) } : m
-      )
-    );
-    loadTasks();
+  async function addTasks(message, picks) {
+    const key = message.id ?? message;
+    if (!picks.length || pendingApprovalsRef.current.has(key)) return;
+    const generation = conversationGenerationRef.current;
+    const approval = {};
+    pendingApprovalsRef.current.set(key, approval);
+    setPendingApprovals(new Set(pendingApprovalsRef.current.keys()));
+    setError("");
+    let created = false;
+    try {
+      for (const t of picks) {
+        await api("/tasks", { method: "POST", body: t });
+        created = true;
+        if (generation === conversationGenerationRef.current) {
+          // Match the captured message, even if task reconciliation has replaced it.
+          setMessages((ms) => generation !== conversationGenerationRef.current ? ms : ms.map((m) =>
+            m === message || (message.id != null && m.id === message.id)
+              ? { ...m, suggestions: m.suggestions.filter((s) => s !== t) }
+              : m
+          ));
+        }
+      }
+    } catch (e) {
+      if (generation === conversationGenerationRef.current) setError(e.message);
+    } finally {
+      try {
+        if (created) await loadTasks(generation);
+      } finally {
+        if (pendingApprovalsRef.current.get(key) === approval) {
+          pendingApprovalsRef.current.delete(key);
+          setPendingApprovals(new Set(pendingApprovalsRef.current.keys()));
+        }
+      }
+    }
   }
 
   const toggle = async (t) => {
@@ -118,6 +147,8 @@ export default function App() {
   };
   const remove = async (t) => {
     if (pendingTasksRef.current.has(t.id)) return;
+    pendingTasksRef.current.add(t.id);
+    setPendingTasks(new Set(pendingTasksRef.current));
     setError("");
     try {
       await api(`/tasks/${t.id}`, { method: "DELETE" });
@@ -129,14 +160,27 @@ export default function App() {
       await loadTasks();
     } catch (e) {
       setError(e.message);
+    } finally {
+      pendingTasksRef.current.delete(t.id);
+      setPendingTasks(new Set(pendingTasksRef.current));
     }
   };
   const addManual = async (e) => {
     e.preventDefault();
-    if (!title.trim()) return;
-    await api("/tasks", { method: "POST", body: { title } });
-    setTitle("");
-    loadTasks();
+    if (!title.trim() || createPendingRef.current) return;
+    createPendingRef.current = true;
+    setCreating(true);
+    setError("");
+    try {
+      await api("/tasks", { method: "POST", body: { title } });
+      setTitle("");
+      await loadTasks();
+    } catch (e) {
+      setError(e.message);
+    } finally {
+      createPendingRef.current = false;
+      setCreating(false);
+    }
   };
   const newChat = () => {
     conversationGenerationRef.current += 1;
@@ -147,6 +191,8 @@ export default function App() {
     setError("");
     sendPendingRef.current = false;
     setBusy(false);
+    pendingApprovalsRef.current.clear();
+    setPendingApprovals(new Set());
   };
 
   const open = tasks.filter((t) => !t.done);
@@ -188,11 +234,11 @@ export default function App() {
                         <strong>{s.title}</strong>
                         {s.due && <small>Due {s.due}</small>}
                       </div>
-                      <button onClick={() => addTasks(i, [s])}>Add task</button>
+                      <button disabled={pendingApprovals.has(m.id ?? m)} onClick={() => addTasks(m, [s])}>Add task</button>
                     </div>
                   ))}
                   {m.suggestions.length > 1 && (
-                    <button className="primary" onClick={() => addTasks(i, m.suggestions)}>
+                    <button className="primary" disabled={pendingApprovals.has(m.id ?? m)} onClick={() => addTasks(m, m.suggestions)}>
                       Add all {m.suggestions.length} tasks
                     </button>
                   )}
@@ -214,7 +260,7 @@ export default function App() {
       <aside className="tasks" aria-label="Tasks">
         <h2>Tasks <span>{open.length} open</span></h2>
         <form onSubmit={addManual} className="manual">
-          <input value={title} onChange={(e) => setTitle(e.target.value)} placeholder="Add a task" aria-label="New task" />
+          <input value={title} disabled={creating} onChange={(e) => setTitle(e.target.value)} placeholder="Add a task" aria-label="New task" />
         </form>
         {open.length === 0 && <p className="hint">No open tasks. Ask the assistant to plan something.</p>}
         <ul>{open.map((t) => <Row key={t.id} t={t} toggle={toggle} remove={remove} pending={pendingTasks.has(t.id)} />)}</ul>
